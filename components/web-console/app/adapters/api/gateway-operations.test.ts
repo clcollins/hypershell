@@ -75,11 +75,13 @@ function gateway(overrides: Partial<Gateway> = {}): Gateway {
     image: "",
     kind: "Gateway",
     name: "Team gateway",
+    image_pinned: false,
     namespace: "openshell",
     observed_generation: 1,
     oidc: "",
     phase: "",
     provisioning_conditions: "",
+    provisioning_version: "",
     route: "",
     route_address: "",
     server_dns_names: "",
@@ -438,6 +440,63 @@ describe("gateway API operations adapter", () => {
     );
   });
 
+  it("collects provisioning versions across every registered-cluster page", async () => {
+    managedClusterApi.list
+      .mockResolvedValueOnce({
+        items: Array.from({ length: 20 }, (_, index) =>
+          managedCluster({
+            capabilities: "gateway-version/v0.1.2-rhaiv.7",
+            id: `cluster-a-${String(index)}`,
+          }),
+        ),
+        kind: "ManagedClusterList",
+        page: 1,
+        size: 20,
+        total: 21,
+      })
+      .mockResolvedValueOnce({
+        items: [
+          managedCluster({
+            capabilities: "gateway-version/v0.2.0-rhaiv.1",
+            id: "cluster-b-0",
+          }),
+        ],
+        kind: "ManagedClusterList",
+        page: 2,
+        size: 20,
+        total: 21,
+      });
+
+    if (!controlPlane.getGatewayProvisioningVersions) {
+      throw new Error("getGatewayProvisioningVersions is not implemented");
+    }
+    await expect(
+      controlPlane.getGatewayProvisioningVersions(context),
+    ).resolves.toEqual(["v0.1.2-rhaiv.7", "v0.2.0-rhaiv.1"]);
+    expect(managedClusterApi.list).toHaveBeenCalledTimes(2);
+    expect(managedClusterApi.list).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ page: 2, search: "oidc_subject <> ''" }),
+      expect.anything(),
+    );
+  });
+
+  it("reads one page of provisioning versions when the first page is short", async () => {
+    managedClusterApi.list.mockResolvedValue(
+      managedClusterList([
+        managedCluster({ capabilities: "gateway-version/v0.1.2-rhaiv.7" }),
+      ]),
+    );
+
+    if (!controlPlane.getGatewayProvisioningVersions) {
+      throw new Error("getGatewayProvisioningVersions is not implemented");
+    }
+    await expect(
+      controlPlane.getGatewayProvisioningVersions(context),
+    ).resolves.toEqual(["v0.1.2-rhaiv.7"]);
+    expect(managedClusterApi.list).toHaveBeenCalledOnce();
+  });
+
   it("treats ILIKE wildcard and escape characters as search literals", async () => {
     managedClusterApi.list.mockResolvedValue(managedClusterList([]));
     gatewayApi.list.mockResolvedValue(gatewayList([], 0, 1));
@@ -622,6 +681,52 @@ describe("gateway API operations adapter", () => {
     await expect(
       controlPlane.getGateway("gateway-1", context),
     ).resolves.toMatchObject({ gatewayVersion: "v0.0.109-rh9a8f8" });
+  });
+
+  it("maps provisioning_version and image_pinned onto the gateway record", async () => {
+    gatewayApi.get.mockResolvedValue(
+      gateway({
+        gateway_version: "v0.1.1-rhaiv.3",
+        image_pinned: true,
+        provisioning_version: " v0.1.2-rhaiv.7 ",
+      }),
+    );
+
+    await expect(
+      controlPlane.getGateway("gateway-1", context),
+    ).resolves.toMatchObject({
+      gatewayVersion: "v0.1.1-rhaiv.3",
+      imagePinned: true,
+      provisioningVersion: "v0.1.2-rhaiv.7",
+    });
+  });
+
+  it("omits the provisioning version when the cluster advertises none", async () => {
+    gatewayApi.get.mockResolvedValue(gateway({ provisioning_version: "" }));
+
+    const result = await controlPlane.getGateway("gateway-1", context);
+
+    expect(result.provisioningVersion).toBeUndefined();
+  });
+
+  it("sorts gateways by the API gateway-version field", async () => {
+    gatewayApi.list.mockResolvedValue(gatewayList([], 0, 1));
+
+    await controlPlane.listGateways(
+      {
+        ...listRequest,
+        page: 1,
+        search: "",
+        sortDirection: "asc",
+        sortField: "version",
+      },
+      context,
+    );
+
+    expect(gatewayApi.list).toHaveBeenCalledWith(
+      expect.objectContaining({ orderBy: "gateway_version asc" }),
+      { signal: undefined },
+    );
   });
 
   it("leaves the console URL unavailable when console_address is absent", async () => {
