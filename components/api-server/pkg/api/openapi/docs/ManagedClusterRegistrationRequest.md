@@ -4,16 +4,15 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**Name** | **string** | Human-readable spoke name, unique per fleet (e.g. hyp0-mc1). Must match on every subsequent call. | 
-**Description** | Pointer to **string** | Optional description of the spoke. | [optional] 
-**Provider** | Pointer to **string** | Cloud provider hosting this control plane. | [optional] 
-**Visibility** | Pointer to **string** | Network visibility supported for gateways on this control plane. | [optional] 
+**Name** | **string** | Human-readable spoke name, unique per fleet (e.g. hyp0-mc1). Must match on every subsequent call. |
+**Description** | Pointer to **string** | Optional description of the spoke. | [optional]
+**Capabilities** | **[]string** | Complete self-declared capability set. |
 
 ## Methods
 
 ### NewManagedClusterRegistrationRequest
 
-`func NewManagedClusterRegistrationRequest(name string, ) *ManagedClusterRegistrationRequest`
+`func NewManagedClusterRegistrationRequest(name string, capabilities []string, ) *ManagedClusterRegistrationRequest`
 
 NewManagedClusterRegistrationRequest instantiates a new ManagedClusterRegistrationRequest object
 This constructor will assign default values to properties that have it defined,
@@ -73,57 +72,25 @@ SetDescription sets Description field to given value.
 
 HasDescription returns a boolean if a field has been set.
 
-### GetProvider
+### GetCapabilities
 
-`func (o *ManagedClusterRegistrationRequest) GetProvider() string`
+`func (o *ManagedClusterRegistrationRequest) GetCapabilities() []string`
 
-GetProvider returns the Provider field if non-nil, zero value otherwise.
+GetCapabilities returns the Capabilities field if non-nil, zero value otherwise.
 
-### GetProviderOk
+### GetCapabilitiesOk
 
-`func (o *ManagedClusterRegistrationRequest) GetProviderOk() (*string, bool)`
+`func (o *ManagedClusterRegistrationRequest) GetCapabilitiesOk() (*[]string, bool)`
 
-GetProviderOk returns a tuple with the Provider field if it's non-nil, zero value otherwise
+GetCapabilitiesOk returns a tuple with the Capabilities field if it's non-nil, zero value otherwise
 and a boolean to check if the value has been set.
 
-### SetProvider
+### SetCapabilities
 
-`func (o *ManagedClusterRegistrationRequest) SetProvider(v string)`
+`func (o *ManagedClusterRegistrationRequest) SetCapabilities(v []string)`
 
-SetProvider sets Provider field to given value.
+SetCapabilities sets Capabilities field to given value.
 
-### HasProvider
-
-`func (o *ManagedClusterRegistrationRequest) HasProvider() bool`
-
-HasProvider returns a boolean if a field has been set.
-
-### GetVisibility
-
-`func (o *ManagedClusterRegistrationRequest) GetVisibility() string`
-
-GetVisibility returns the Visibility field if non-nil, zero value otherwise.
-
-### GetVisibilityOk
-
-`func (o *ManagedClusterRegistrationRequest) GetVisibilityOk() (*string, bool)`
-
-GetVisibilityOk returns a tuple with the Visibility field if it's non-nil, zero value otherwise
-and a boolean to check if the value has been set.
-
-### SetVisibility
-
-`func (o *ManagedClusterRegistrationRequest) SetVisibility(v string)`
-
-SetVisibility sets Visibility field to given value.
-
-### HasVisibility
-
-`func (o *ManagedClusterRegistrationRequest) HasVisibility() bool`
-
-HasVisibility returns a boolean if a field has been set.
 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
-
-

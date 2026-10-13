@@ -1834,7 +1834,7 @@ import json, os
 body = {
     'name': os.environ['GW_NAME'],
     'placement': ({'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind'
-                  else {'network': 'public', 'provider': 'aws'}),
+                  else {'selector': ['network/public', 'provider/aws']}),
     'oidc': json.dumps({
         'issuer': os.environ['E2E_OIDC_ISSUER'],
         'audience': os.environ['E2E_OIDC_CLIENT_ID'],
@@ -2531,7 +2531,7 @@ import json, os
 body = {
     'name': os.environ['GW_NAME'],
     'placement': ({'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind'
-                  else {'network': 'public', 'provider': 'aws'}),
+                  else {'selector': ['network/public', 'provider/aws']}),
     'oidc': json.dumps({
         'issuer': os.environ['E2E_OIDC_ISSUER'],
         'audience': os.environ['E2E_OIDC_CLIENT_ID'],
@@ -2851,15 +2851,26 @@ print('%s\t%s' % (subject, age))
   fi
 
   # ── 12b. Registration is idempotent ──
+  MC_ORIGINAL=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/${E2E_CLUSTER_ID}" 2>/dev/null || true)
+  MC_ORIGINAL_CAPS=$(echo "$MC_ORIGINAL" | python3 -c '
+import json, sys
+try:
+    caps = json.load(sys.stdin).get("capabilities", [])
+    print(json.dumps(sorted(caps), separators=(",", ":")))
+except Exception:
+    print("[]")
+')
   MC_LS_BEFORE=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/${E2E_CLUSTER_ID}" 2>/dev/null | e2e_json_field last_seen_at)
   if acquire_registrar_token; then
     pass "Registrar client-credentials token acquired (${E2E_REGISTRAR_CLIENT_ID})"
-    show_cmd "api_curl -X POST ${API_HOST}/api/hypershell/v1/managed_clusters/registration -d '{name: ${E2E_SEED_CLUSTER_NAME}}'"
+    show_cmd "api_curl -X POST ${API_HOST}/api/hypershell/v1/managed_clusters/registration -d '{name: ${E2E_SEED_CLUSTER_NAME}, capabilities: <current>}'"
     REG1=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
-      -X POST -H "Content-Type: application/json" -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\"}" 2>/dev/null || true)
+      -X POST -H "Content-Type: application/json" \
+      -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\",\"capabilities\":${MC_ORIGINAL_CAPS}}" 2>/dev/null || true)
     REG1_ID=$(echo "$REG1" | e2e_json_field cluster_id)
     REG2=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
-      -X POST -H "Content-Type: application/json" -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\"}" 2>/dev/null || true)
+      -X POST -H "Content-Type: application/json" \
+      -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\",\"capabilities\":${MC_ORIGINAL_CAPS}}" 2>/dev/null || true)
     REG2_ID=$(echo "$REG2" | e2e_json_field cluster_id)
     if [[ -n "$REG1_ID" && "$REG1_ID" == "$E2E_CLUSTER_ID" && "$REG2_ID" == "$E2E_CLUSTER_ID" ]]; then
       pass "Re-registration is idempotent (both calls returned the existing cluster_id ${E2E_CLUSTER_ID})"
@@ -2878,6 +2889,86 @@ print('%s\t%s' % (subject, age))
       pass "Registration POST accepted and heartbeat timestamp present"
     else
       fail_test "Could not read last_seen_at after registration"
+    fi
+
+    # Capability declarations are a complete replacement, and validation is
+    # atomic: a rejected heartbeat must update neither the set nor last_seen_at.
+    MC_REPLACEMENT_CAPS=$(ORIGINAL_CAPS="$MC_ORIGINAL_CAPS" python3 -c '
+import json, os
+caps = set(json.loads(os.environ["ORIGINAL_CAPS"]))
+caps.add("runtime/e2e-validation")
+print(json.dumps(sorted(caps), separators=(",", ":")))
+')
+
+    if [[ "$MC_ORIGINAL_CAPS" != "[]" ]]; then
+      acquire_registrar_token 2>/dev/null || true
+      show_cmd "api_curl -X POST .../managed_clusters/registration -d '{name: ${E2E_SEED_CLUSTER_NAME}, capabilities: <replacement>}'"
+      REG_REPLACE=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\",\"capabilities\":${MC_REPLACEMENT_CAPS}}" 2>/dev/null || true)
+      REG_REPLACE_ID=$(echo "$REG_REPLACE" | e2e_json_field cluster_id)
+      acquire_oidc_token 2>/dev/null || true
+      MC_REPLACED=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/${E2E_CLUSTER_ID}" 2>/dev/null || true)
+      MC_REPLACED_CAPS=$(echo "$MC_REPLACED" | python3 -c '
+import json, sys
+try:
+    print(json.dumps(sorted(json.load(sys.stdin).get("capabilities", [])), separators=(",", ":")))
+except Exception:
+    print("[]")
+')
+      MC_REPLACED_LS=$(echo "$MC_REPLACED" | e2e_json_field last_seen_at)
+      if [[ "$REG_REPLACE_ID" == "$E2E_CLUSTER_ID" && "$MC_REPLACED_CAPS" == "$MC_REPLACEMENT_CAPS" ]]; then
+        pass "Registration replaced the complete declared capability set"
+      else
+        fail_test "Capability replacement mismatch (got ${MC_REPLACED_CAPS}, want ${MC_REPLACEMENT_CAPS})"
+      fi
+
+      MC_INVALID_CAPS=$(VALID_CAPS="$MC_REPLACEMENT_CAPS" python3 -c '
+import json, os
+caps = json.loads(os.environ["VALID_CAPS"])
+caps.append("unknown/e2e-validation")
+print(json.dumps(caps, separators=(",", ":")))
+')
+      acquire_registrar_token 2>/dev/null || true
+      show_cmd "api_curl -X POST .../managed_clusters/registration (unknown capability namespace) -> expect 400"
+      MC_INVALID_CODE=$(e2e_http_status POST "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\",\"capabilities\":${MC_INVALID_CAPS}}")
+      acquire_oidc_token 2>/dev/null || true
+      MC_AFTER_INVALID=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/${E2E_CLUSTER_ID}" 2>/dev/null || true)
+      MC_AFTER_INVALID_CAPS=$(echo "$MC_AFTER_INVALID" | python3 -c '
+import json, sys
+try:
+    print(json.dumps(sorted(json.load(sys.stdin).get("capabilities", [])), separators=(",", ":")))
+except Exception:
+    print("[]")
+')
+      MC_AFTER_INVALID_LS=$(echo "$MC_AFTER_INVALID" | e2e_json_field last_seen_at)
+      if [[ "$MC_INVALID_CODE" == "400" && "$MC_AFTER_INVALID_CAPS" == "$MC_REPLACED_CAPS" && "$MC_AFTER_INVALID_LS" == "$MC_REPLACED_LS" ]]; then
+        pass "Invalid capability set is 400 and preserves capabilities and last_seen_at atomically"
+      else
+        fail_test "Invalid capability registration was not atomic (status=${MC_INVALID_CODE:-none}, capabilities=${MC_AFTER_INVALID_CAPS}, last_seen_at=${MC_REPLACED_LS}->${MC_AFTER_INVALID_LS})"
+      fi
+
+      acquire_registrar_token 2>/dev/null || true
+      REG_RESTORE=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"name\":\"${E2E_SEED_CLUSTER_NAME}\",\"capabilities\":${MC_ORIGINAL_CAPS}}" 2>/dev/null || true)
+      acquire_oidc_token 2>/dev/null || true
+      MC_RESTORED_CAPS=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters/${E2E_CLUSTER_ID}" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.dumps(sorted(json.load(sys.stdin).get("capabilities", [])), separators=(",", ":")))
+except Exception:
+    print("[]")
+')
+      if [[ "$(echo "$REG_RESTORE" | e2e_json_field cluster_id)" == "$E2E_CLUSTER_ID" && "$MC_RESTORED_CAPS" == "$MC_ORIGINAL_CAPS" ]]; then
+        pass "Original declared capability set restored after validation"
+      else
+        fail_test "Could not restore original capability set (got ${MC_RESTORED_CAPS}, want ${MC_ORIGINAL_CAPS})"
+      fi
+    else
+      fail_test "ManagedCluster ${E2E_SEED_CLUSTER_NAME} has no declared capabilities to validate"
     fi
   else
     fail_test "Could not acquire the registrar client-credentials token (${E2E_REGISTRAR_CLIENT_ID})"
@@ -2898,9 +2989,10 @@ print('%s\t%s' % (subject, age))
   # ── 12d. Name collision rejected ──
   if acquire_registrar_token; then
     COLLIDE_NAME="${E2E_SEED_CLUSTER_NAME}-collide-$RANDOM"
-    show_cmd "api_curl -X POST .../managed_clusters/registration -d '{name: ${COLLIDE_NAME}}' (registrar, different name) -> expect 409"
+    show_cmd "api_curl -X POST .../managed_clusters/registration -d '{name: ${COLLIDE_NAME}, capabilities: <current>}' (registrar, different name) -> expect 409"
     COLLIDE_CODE=$(e2e_http_status POST "${API_HOST}/api/hypershell/v1/managed_clusters/registration" \
-      -H "Content-Type: application/json" -d "{\"name\":\"${COLLIDE_NAME}\"}")
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"${COLLIDE_NAME}\",\"capabilities\":${MC_ORIGINAL_CAPS}}")
     acquire_oidc_token 2>/dev/null || true
     COLLIDE_PRESENT=$(api_curl "${API_HOST}/api/hypershell/v1/managed_clusters?search=name%3D%27${COLLIDE_NAME}%27" 2>/dev/null | e2e_json_field total)
     if [[ "$COLLIDE_CODE" == "409" ]]; then
@@ -2924,7 +3016,7 @@ import json, os
 print(json.dumps({
     'name': os.environ['GW_NAME'],
     'cluster_id': '',
-    'placement': {'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind' else {'network': 'public', 'provider': 'aws'},
+    'placement': {'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind' else {'selector': ['network/public', 'provider/aws']},
     'oidc': json.dumps({'issuer': os.environ['E2E_OIDC_ISSUER'], 'audience': os.environ['E2E_OIDC_CLIENT_ID'],
                         'roles_claim': 'groups', 'admin_role': 'hypershell-admins', 'user_role': 'hypershell-users'}),
     'route': json.dumps({'enabled': True}),
@@ -2954,7 +3046,7 @@ import json, os
 print(json.dumps({
     'name': os.environ['GW_NAME'],
     'cluster_id': os.environ['PH_ID'],
-    'placement': {'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind' else {'network': 'public', 'provider': 'aws'},
+    'placement': {'mode': 'local-kind'} if os.environ.get('E2E_INFRA_DRIVER') == 'kind' else {'selector': ['network/public', 'provider/aws']},
     'oidc': json.dumps({'issuer': os.environ['E2E_OIDC_ISSUER'], 'audience': os.environ['E2E_OIDC_CLIENT_ID'],
                         'roles_claim': 'groups', 'admin_role': 'hypershell-admins', 'user_role': 'hypershell-users'}),
     'route': json.dumps({'enabled': True}),
@@ -3404,17 +3496,19 @@ except Exception: pass" "$PADMIN_USERS_FILE" 2>/dev/null)
   acquire_oidc_token 2>/dev/null || true
 
   # ── 14b. Unknown gateway phase rejected ──
-  # Any existing gateway serves as the target; the PATCH is rejected before any
-  # write, so the stored phase is unchanged.
-  PHASE_GW_JSON=$(api_curl "${API_HOST}/api/hypershell/v1/gateways?size=1" 2>/dev/null || true)
-  PHASE_GW_ID=$(echo "$PHASE_GW_JSON" | python3 -c "import json,sys
-try:
-    items=json.load(sys.stdin).get('items',[])
-    print(items[0].get('id','') if items else '')
-except Exception: pass" 2>/dev/null)
+  # Use a dedicated gateway created by the active identity. The admin can see
+  # gateways it does not own, but visibility alone does not grant PATCH access;
+  # selecting the first visible gateway makes this validation depend on list
+  # order and can produce 403 before request validation runs.
+  PHASE_GW_NAME="e2e-phase-validation-$RANDOM"
+  PHASE_GW_BODY=$(e2e_gateway_create_body "$PHASE_GW_NAME")
+  PHASE_GW_RESPONSE=$(api_curl -X POST "${API_HOST}/api/hypershell/v1/gateways" \
+    -H "Content-Type: application/json" -d "$PHASE_GW_BODY" 2>/dev/null || true)
+  PHASE_GW_ID=$(echo "$PHASE_GW_RESPONSE" | e2e_json_field id)
   if [[ -z "$PHASE_GW_ID" ]]; then
-    dim "  Skipped unknown-phase check: no gateway available to target"
+    fail_test "Could not create the owned gateway for unknown-phase validation"
   else
+    E2E_EXTRA_GW_IDS+=("$PHASE_GW_ID")
     PHASE_BEFORE=$(api_curl "${API_HOST}/api/hypershell/v1/gateways/${PHASE_GW_ID}" 2>/dev/null | e2e_json_field phase)
     show_cmd "api_curl -X PATCH .../gateways/${PHASE_GW_ID} -d '{phase: Bogus}'  # expect 400"
     PHASE_FILE=$(mktemp)
@@ -3432,6 +3526,15 @@ except Exception: pass" 2>/dev/null)
       pass "Stored gateway phase is unchanged after the rejected write (${PHASE_AFTER})"
     else
       fail_test "Stored gateway phase changed after a rejected write (${PHASE_BEFORE} -> ${PHASE_AFTER})"
+    fi
+    PHASE_DELETE_CODE=$(api_curl -o /dev/null -w '%{http_code}' -X DELETE \
+      "${API_HOST}/api/hypershell/v1/gateways/${PHASE_GW_ID}" 2>/dev/null || true)
+    if [[ "$PHASE_DELETE_CODE" == "204" || "$PHASE_DELETE_CODE" == "200" ]]; then
+      PHASE_NEW_EXTRA=()
+      for _x in "${E2E_EXTRA_GW_IDS[@]}"; do
+        [[ "$_x" != "$PHASE_GW_ID" ]] && PHASE_NEW_EXTRA+=("$_x")
+      done
+      E2E_EXTRA_GW_IDS=("${PHASE_NEW_EXTRA[@]}")
     fi
   fi
 fi

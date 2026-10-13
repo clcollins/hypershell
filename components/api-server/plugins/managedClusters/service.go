@@ -3,6 +3,9 @@ package managedClusters
 import (
 	"context"
 	stderrors "errors"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -31,7 +34,7 @@ type ManagedClusterService interface {
 	// held by a record with a different or empty oidc_subject, or a subject
 	// already registered under another name, is a 409 Conflict: registration
 	// never creates a duplicate name and never adopts an existing record.
-	Register(ctx context.Context, name, description, provider, visibility, oidcSubject string) (*ManagedCluster, bool, *errors.ServiceError)
+	Register(ctx context.Context, name, description string, capabilities []string, oidcSubject string) (*ManagedCluster, bool, *errors.ServiceError)
 	// FindRegisteredBySubject returns the ManagedCluster a control plane
 	// registered under the given OIDC subject, or (nil, nil) when the subject
 	// has not registered. An empty subject never matches.
@@ -169,7 +172,59 @@ func (s *sqlManagedClusterService) All(ctx context.Context) (ManagedClusterList,
 	return managedClusters, nil
 }
 
-func (s *sqlManagedClusterService) Register(ctx context.Context, name, description, provider, visibility, oidcSubject string) (*ManagedCluster, bool, *errors.ServiceError) {
+var capabilitySegmentRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+var capabilityNamespaces = map[string]bool{"provider": true, "network": true, "region": true, "runtime": true, "environment": true}
+var singleCapabilityNamespaces = map[string]bool{"provider": true, "region": true, "environment": true}
+
+// NormalizeCapabilities validates capability labels and returns a stable,
+// deduplicated representation suitable for persistence and selector matching.
+func NormalizeCapabilities(labels []string, requireNonEmpty bool) ([]string, *errors.ServiceError) {
+	return normalizeCapabilityLabels(labels, requireNonEmpty, true, true)
+}
+
+// NormalizeSelector applies the same vocabulary while collapsing duplicates,
+// because selectors are query intent rather than the declared source-of-truth set.
+func NormalizeSelector(labels []string) ([]string, *errors.ServiceError) {
+	return normalizeCapabilityLabels(labels, true, false, false)
+}
+
+func normalizeCapabilityLabels(labels []string, requireNonEmpty, rejectDuplicates, enforceSingleValue bool) ([]string, *errors.ServiceError) {
+	if len(labels) == 0 {
+		if requireNonEmpty {
+			return nil, errors.Validation("capabilities must contain at least one label")
+		}
+		return nil, nil
+	}
+	seen, namespaceCounts := map[string]bool{}, map[string]int{}
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		parts := strings.Split(label, "/")
+		if len(parts) != 2 || !capabilityNamespaces[parts[0]] || !capabilitySegmentRE.MatchString(parts[0]) || !capabilitySegmentRE.MatchString(parts[1]) {
+			return nil, errors.Validation("invalid capability label %q: expected a recognized namespace and lowercase DNS-label value", label)
+		}
+		if seen[label] {
+			if rejectDuplicates {
+				return nil, errors.Validation("duplicate capability label %q", label)
+			}
+			continue
+		}
+		seen[label] = true
+		namespaceCounts[parts[0]]++
+		if enforceSingleValue && singleCapabilityNamespaces[parts[0]] && namespaceCounts[parts[0]] > 1 {
+			return nil, errors.Validation("capability namespace %q accepts only one value", parts[0])
+		}
+		result = append(result, label)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func (s *sqlManagedClusterService) Register(ctx context.Context, name, description string, capabilities []string, oidcSubject string) (*ManagedCluster, bool, *errors.ServiceError) {
+	capabilities, validationErr := NormalizeCapabilities(capabilities, true)
+	if validationErr != nil {
+		return nil, false, validationErr
+	}
 	lockOwnerID, lockErr := s.lockFactory.NewAdvisoryLock(ctx, oidcSubject, managedClustersLockType)
 	if lockErr != nil {
 		return nil, false, errors.DatabaseAdvisoryLock(lockErr)
@@ -187,12 +242,7 @@ func (s *sqlManagedClusterService) Register(ctx context.Context, name, descripti
 		}
 		now := time.Now()
 		existing.LastSeenAt = &now
-		// A legacy control plane omits placement metadata. Its heartbeat must
-		// refresh connectivity without erasing values from a newer registration.
-		if provider != "" {
-			existing.Provider = provider
-			existing.Visibility = visibility
-		}
+		existing.Capabilities = append([]string(nil), capabilities...)
 		updated, replaceErr := s.managedClusterDao.Replace(ctx, existing)
 		if replaceErr != nil {
 			return nil, false, services.HandleUpdateError("ManagedCluster", replaceErr)
@@ -225,11 +275,7 @@ func (s *sqlManagedClusterService) Register(ctx context.Context, name, descripti
 		return nil, false, errors.GeneralError("registration lookup failed: %s", delErr)
 	}
 	if deleted != nil {
-		if provider == "" {
-			provider = deleted.Provider
-			visibility = deleted.Visibility
-		}
-		restored, restoreErr := s.managedClusterDao.Restore(ctx, deleted.ID, provider, visibility, now)
+		restored, restoreErr := s.managedClusterDao.Restore(ctx, deleted.ID, "", "", capabilities, now)
 		if restoreErr != nil {
 			if isUniqueViolation(restoreErr) {
 				if winner, err := s.managedClusterDao.FindByName(ctx, name); err == nil && winner != nil {
@@ -249,11 +295,10 @@ func (s *sqlManagedClusterService) Register(ctx context.Context, name, descripti
 	}
 
 	cluster := &ManagedCluster{
-		Name:        name,
-		OIDCSubject: oidcSubject,
-		LastSeenAt:  &now,
-		Provider:    provider,
-		Visibility:  visibility,
+		Name:         name,
+		OIDCSubject:  oidcSubject,
+		LastSeenAt:   &now,
+		Capabilities: append([]string(nil), capabilities...),
 	}
 	cluster.CaptureTraceContext(ctx)
 	created, createErr := s.managedClusterDao.Create(ctx, cluster)
