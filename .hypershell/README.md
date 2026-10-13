@@ -5,23 +5,68 @@ It is to HyperShell agents what `.github/` is to GitHub Actions: repo-local
 automation that decorates the repo with agent capabilities without being part
 of the core platform.
 
-## agents/
+Automation is **declarative**. This directory is a Kustomize root. A server-side
+import process (see `Repository.import_path` in
+`specs/platform/data-model.spec.md`) builds a kustomization and reconciles the
+rendered HyperShell ext-API resources into the API. The former imperative
+`discover.sh` / `run.sh` script contract has been removed; an `AgentRuntime` with
+a `selector` now expresses discovery declaratively.
 
-Each subdirectory under `agents/` corresponds to one named agent in the SDLC
-automation pipeline. Only `skills/agent-loop/` agents belong here. General
-platform skills (amber-review, plan/spec, build/reconcile, tooling/, etc.)
-remain in `skills/`.
+These manifests carry **no explicit cluster**. The `Gateway` is fully
+declarable: it states the *type* of placement it wants as capability-label
+selectors (e.g. `network/public`, `provider/ibm`) rather than a `cluster_id`, and
+the control plane resolves and assigns a matching `ManagedCluster` at provision
+time. Agents reference that gateway by name and assume it provisions when applied
+to a cluster whose capabilities match.
 
-### Defined Agents
+## Layout
 
-| Agent | Queue label(s) | Output label(s) |
-|-------|----------------|-----------------|
-| `triage` | `agent/allowed` (no triage label) | `agent/workable`, `agent/needs-input`, `agent/duplicate` |
-| `spec-implementation` | `agent/workable` or `agent/review-spec-rejected` (no `agent/reviewable-spec`) | `agent/reviewable-spec` |
-| `spec-review` | `agent/reviewable-spec` (no verdict) | `agent/review-spec-approved`, `agent/review-spec-rejected` |
-| `code-implementation` | `agent/review-spec-approved` (no `agent/reviewable-code`) | `agent/reviewable-code` |
-| `code-review` | `agent/reviewable-code` (no verdict) | `agent/review-code-approved`, `agent/review-code-rejected` |
-| `release-verification` | `agent/release-pending` (no verdict) | `agent/release-verified`, `agent/release-verification-failed` |
+```
+.hypershell/
+├── kustomization.yaml          # root import: the full fleet (base/platform + every agent)
+├── base/                       # the basic agent (standalone, runnable)
+│   ├── kustomization.yaml      # platform + agent.yaml
+│   ├── agent.yaml              # one complete AgentRuntime graph (slim runtime)
+│   └── platform/               # shared, reusable kinds referenced by name
+│       ├── kustomization.yaml
+│       ├── repository.yaml     # Repository (this repo) + credential reference
+│       ├── gateway.yaml        # Gateway (agents-gateway) placed by capability selector
+│       ├── sandbox-template.yaml # agent-runtime-slim + basic network policy
+│       └── provider-specs.yaml # claude-inference, github-source-control
+└── agents/<name>/              # agent instances (overlays on base/platform)
+    ├── agent.yaml              # AgentRuntime (selector) + SecretSources + ProviderBindings + InferenceRoute
+    ├── kustomization.yaml      # base/platform + agent.yaml
+    └── SKILL.md                # the agent's workflow prompt (unchanged)
+```
+
+- **`base/`** is one complete basic agent with the slim runtime and the basic
+  network policy, plus all the declared platform kinds. It is directly runnable:
+  `hsctl apply -k .hypershell/base`.
+- **`agents/<name>/`** are the real agent instances. Each is an overlay that
+  reuses the shared `base/platform` kinds (by name) and adds its own
+  `AgentRuntime` (with `selector`) and owned ext-API objects. None of them
+  contain cluster information.
+
+`SKILL.md` holds each agent's workflow prompt and is still authored by hand; it
+has no declarative equivalent and is loaded by the coordinator at run time.
+
+## Defined Agents
+
+Each `AgentRuntime` carries a `selector` (a list of labels). On each `cron` tick
+the coordinator queries the referenced `Repository` for items carrying **any**
+selector label and fans out one sandbox per match. `update-openshell` has no
+selector: it is purely scheduled.
+
+| Agent | Selector label(s) | Output label(s) |
+|-------|-------------------|-----------------|
+| `triage` | `agent/allowed` | `agent/workable`, `agent/needs-input`, `agent/duplicate` |
+| `spec-implementation` | `agent/workable`, `agent/review-spec-rejected` | `agent/reviewable-spec` |
+| `spec-review` | `agent/reviewable-spec` | `agent/review-spec-approved`, `agent/review-spec-rejected` |
+| `code-implementation` | `agent/review-spec-approved` | `agent/reviewable-code` |
+| `code-review` | `agent/reviewable-code` | `agent/review-code-approved`, `agent/review-code-rejected` |
+| `review-response` | `agent/needs-review-response` | re-queues spec/code review |
+| `release-verification` | `agent/release-pending` | `agent/release-verified`, `agent/release-verification-failed` |
+| `update-openshell` | (scheduled, no selector) | opens an update PR (`agent/reviewable-code`) |
 
 ### Label state machine
 
@@ -52,104 +97,57 @@ release-verification
     └─► agent/blocked
 ```
 
----
+## Reference resolution
 
-## discover.sh contract
+Foreign keys in these manifests reference other declared resources **by name**
+(e.g. `repository_id: openshift-online/hypershell`, `sandbox_template_id: agent-runtime-slim`,
+`provider_spec_id: claude-inference`, `workspace_id: <runtime-name>`). The import
+process resolves each name to the concrete resource ID at reconcile time.
+`workspace_id` references the runtime's own name because the control plane
+creates exactly one `AgentWorkspace` per `AgentRuntime`; the importer maps the
+runtime to its workspace.
 
-`discover.sh` runs in the **coordinator pod** (not inside an OpenShell sandbox).
-Its job is to find work items and emit them so the coordinator can fan out one
-sandbox per item.
+## Placeholders
 
-### Inputs (environment variables)
+Credential and project values that are environment-specific are written as
+`REPLACE_WITH_*` and must be supplied before the manifests are usable in a given
+environment:
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `REPOSITORY` | yes | `owner/repo` (e.g. `openshift-online/hypershell`) |
-| `MAX_ITEMS` | yes | Maximum items to emit per run (coordinator sets this) |
-| `DRY_RUN` | yes | `true` or `false` |
+| Placeholder | Where | Supply via |
+|-------------|-------|------------|
+| `REPLACE_WITH_GITHUB_APP_ID` | github `ProviderBinding.refresh_strategy` | patch or pre-provision |
 
-The `gh` CLI is pre-authenticated in the coordinator pod.
+Inference uses a URL + token provider: the `claude-inference` ProviderSpec points
+at `https://api.anthropic.com` and the token is supplied by each agent's
+`*-inference-key` SecretSource (`purpose: api-key`). The sandbox reaches
+`api.anthropic.com` directly; the supervisor egress proxy injects the token, so
+no credential enters the sandbox and there is no `inference.local` host.
 
-### Outputs
+The GitHub App credential `SecretSource` named `github-app-credentials`
+(referenced by `base/platform/repository.yaml`) is a platform-provisioned secret
+and is not declared here.
 
-- **stdout**: newline-delimited JSON objects, one per work item. Empty output means no work.
-- **stderr**: human-readable progress messages.
-- **exit code**: always `0`. Failure to discover is not fatal; coordinator logs stderr.
+## Applying
 
-### Requirements
+```sh
+# The basic agent (standalone reference):
+hsctl apply -k .hypershell/base
 
-- Idempotent: running twice with the same GitHub state produces the same output.
-- Never emit more than `MAX_ITEMS` lines.
-- Validate `REPOSITORY` format before making any API calls.
-- Sort items oldest-first (ascending issue/PR number) for stable priority ordering.
+# The full fleet (what the import process does):
+hsctl apply -k .hypershell
 
----
+# A single agent instance:
+hsctl apply -k .hypershell/agents/triage
 
-## run.sh contract
-
-`run.sh` runs **inside an OpenShell sandbox** after the coordinator uploads it.
-It invokes Claude against one work item using the `inference.local` gateway.
-
-### Inputs (environment variables)
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `HYPERSHELL_CHECKOUT` | no | Path to hypershell repo checkout. Default: `/sandbox/hypershell` |
-| `REPOSITORY` | yes | `owner/repo` |
-| `DRY_RUN` | yes | `true` or `false` |
-| `CLAUDE_MODEL` | yes | Set by coordinator in sandbox env |
-| Agent-specific | varies | See each agent's `run.sh` for required vars (e.g. `ITEM_URL`, `PR_URL`) |
-
-### Outputs
-
-- **`/tmp/result.json`**: written before exit. Schema:
-  ```json
-  {"status": "success|skip|failed", "summary": "one-line outcome"}
-  ```
-  On failure: `{"status": "failed", "error": "reason"}`.
-- **exit code**: `0` on success or skip. Non-zero only on infrastructure failure (missing env var, skill file not found).
-
-### Claude invocation pattern
-
-```bash
-ANTHROPIC_BASE_URL=https://inference.local \
-  ANTHROPIC_API_KEY=unused \
-  claude \
-  --model "$CLAUDE_MODEL" \
-  --dangerously-skip-permissions \
-  --verbose \
-  --output-format stream-json \
-  -p "$prompt"
+# Preview without writing:
+hsctl apply -k .hypershell --dry-run
 ```
-
-Where `$prompt` is a heredoc runtime context block concatenated with the content
-of the agent's `SKILL.md`.
-
----
-
-## Coordinator protocol
-
-The gitops coordinator:
-
-1. Clones this repo (`openshift-online/hypershell`) at `TRUSTED_BRANCH` into
-   `/sandbox/hypershell` (or a coordinator-local path for discovery).
-2. Calls `.hypershell/agents/<name>/discover.sh` to get the work queue.
-3. For each emitted JSON line, extracts fields and launches one sandbox Job.
-4. Inside the Job, sets agent-specific env vars from the JSON fields, then
-   executes `.hypershell/agents/<name>/run.sh`.
-5. Reads `/tmp/result.json` after the Job completes and logs the outcome.
-
-The coordinator is responsible for: gateway login, `openshell` installation,
-sandbox lifecycle, secret injection, and GitHub App token refresh. These
-concerns do not belong in `discover.sh` or `run.sh`.
 
 ## Agent runtime images
 
 The image definitions live in [`components/agents`](../components/agents/README.md).
-Use `agent-runtime` for code implementation/review requiring compilers and
-`agent-runtime-slim` for triage/spec automation. Both provide native Claude Code,
-Atlassian CLI, GitHub CLI, hsctl, Python and shell utilities. The harness SHALL
-resolve their image digests from the selected release bundle, clone the trusted
-repository into `/sandbox/hypershell`, and inject per-run credentials. Agent scripts
-and credentials are not embedded in these images. Bundle membership does not
-change existing harness image selections automatically.
+These manifests use `agent-runtime-slim`, which provides native Claude Code,
+Atlassian CLI, GitHub CLI, hsctl, Python and shell utilities. The harness
+resolves its image digest from the selected release bundle, clones the trusted
+repository into `/sandbox/hypershell`, and injects per-run credentials. Agent
+scripts and credentials are not embedded in these images.
