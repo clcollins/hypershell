@@ -6,7 +6,7 @@ import type { ObjectReference, ListMeta } from './base.js';
 
 export type ManagedCluster = ObjectReference & {
   api_server_url: string;
-  capabilities: string;
+  capabilities: string[];
   kubeconfig_secret: string;
   last_seen_at: string;
   name: string;
@@ -14,7 +14,7 @@ export type ManagedCluster = ObjectReference & {
   provider: string;
   region: string;
   status: string;
-  visibility: string;
+  visibility: "public" | "vpn";
 };
 
 export type ManagedClusterList = ListMeta & {

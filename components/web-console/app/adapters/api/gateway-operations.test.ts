@@ -80,11 +80,11 @@ function gateway(overrides: Partial<Gateway> = {}): Gateway {
     observed_generation: 1,
     oidc: "",
     phase: "",
-    provisioning_conditions: "",
+    provisioning_conditions: [],
     provisioning_version: "",
     route: "",
     route_address: "",
-    server_dns_names: "",
+    server_dns_names: [],
     service_type: "",
     status: "Ready",
     supervisor_image: "",
@@ -113,7 +113,7 @@ function managedCluster(
 ): ManagedCluster {
   return {
     api_server_url: "https://api.east.example.com",
-    capabilities: "",
+    capabilities: [],
     created_at: null,
     href: "/api/hypershell/v1/managed_clusters/cluster-east",
     id: "cluster-east",
@@ -445,7 +445,7 @@ describe("gateway API operations adapter", () => {
       .mockResolvedValueOnce({
         items: Array.from({ length: 20 }, (_, index) =>
           managedCluster({
-            capabilities: "gateway-version/v0.1.2-rhaiv.7",
+            capabilities: ["gateway-version/v0.1.2-rhaiv.7"],
             id: `cluster-a-${String(index)}`,
           }),
         ),
@@ -457,7 +457,7 @@ describe("gateway API operations adapter", () => {
       .mockResolvedValueOnce({
         items: [
           managedCluster({
-            capabilities: "gateway-version/v0.2.0-rhaiv.1",
+            capabilities: ["gateway-version/v0.2.0-rhaiv.1"],
             id: "cluster-b-0",
           }),
         ],
@@ -484,7 +484,7 @@ describe("gateway API operations adapter", () => {
   it("reads one page of provisioning versions when the first page is short", async () => {
     managedClusterApi.list.mockResolvedValue(
       managedClusterList([
-        managedCluster({ capabilities: "gateway-version/v0.1.2-rhaiv.7" }),
+        managedCluster({ capabilities: ["gateway-version/v0.1.2-rhaiv.7"] }),
       ]),
     );
 
