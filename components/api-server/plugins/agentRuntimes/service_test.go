@@ -43,9 +43,22 @@ func (f *fakeEventService) FindBySourceAndType(ctx context.Context, source strin
 // fakeAgentRuntimeDao is an in-memory AgentRuntimeDao for validation tests.
 type fakeAgentRuntimeDao struct {
 	repositoryExists bool
+	// getResult, when set, is returned by Get so a test can seed the current row;
+	// nil returns an empty AgentRuntime (the default for validation tests).
+	getResult *agentRuntimes.AgentRuntime
+	// replaceCalls counts Replace invocations so a test can assert the status
+	// write short-circuits when nothing changes.
+	replaceCalls int
+	// updateStatusCalls counts UpdateStatus invocations so a test can assert the
+	// status write-back goes through the column-scoped path (and short-circuits
+	// when nothing changes).
+	updateStatusCalls int
 }
 
 func (f *fakeAgentRuntimeDao) Get(ctx context.Context, id string) (*agentRuntimes.AgentRuntime, error) {
+	if f.getResult != nil {
+		return f.getResult, nil
+	}
 	return &agentRuntimes.AgentRuntime{}, nil
 }
 
@@ -58,6 +71,20 @@ func (f *fakeAgentRuntimeDao) Create(ctx context.Context, ar *agentRuntimes.Agen
 }
 
 func (f *fakeAgentRuntimeDao) Replace(ctx context.Context, ar *agentRuntimes.AgentRuntime) (*agentRuntimes.AgentRuntime, error) {
+	f.replaceCalls++
+	return ar, nil
+}
+
+func (f *fakeAgentRuntimeDao) UpdateStatus(ctx context.Context, id string, status string, statusMessage *string) (*agentRuntimes.AgentRuntime, error) {
+	f.updateStatusCalls++
+	ar := &agentRuntimes.AgentRuntime{}
+	if f.getResult != nil {
+		cp := *f.getResult
+		ar = &cp
+	}
+	s := status
+	ar.Status = &s
+	ar.StatusMessage = statusMessage
 	return ar, nil
 }
 
@@ -144,5 +171,54 @@ func TestCreate_NoClusterID_OK(t *testing.T) {
 	}
 	if _, err := svc.Create(context.Background(), ar); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpdateStatus_PersistsTransition(t *testing.T) {
+	dao := &fakeAgentRuntimeDao{getResult: &agentRuntimes.AgentRuntime{Status: strPtr("Pending")}}
+	svc := agentRuntimes.NewAgentRuntimeService(dao, &fakeEventService{})
+
+	got, err := svc.UpdateStatus(context.Background(), "ar-1", "Provisioning", nil)
+	if err != nil {
+		t.Fatalf("UpdateStatus returned error: %v", err)
+	}
+	if got.Status == nil || *got.Status != "Provisioning" {
+		t.Fatalf("status = %v, want Provisioning", got.Status)
+	}
+	// The write-back must go through the column-scoped UpdateStatus, not a full-row
+	// Replace that could clobber a concurrent spec PATCH.
+	if dao.updateStatusCalls != 1 {
+		t.Fatalf("updateStatusCalls = %d, want 1", dao.updateStatusCalls)
+	}
+	if dao.replaceCalls != 0 {
+		t.Fatalf("replaceCalls = %d, want 0 (status write must not full-row Replace)", dao.replaceCalls)
+	}
+}
+
+func TestUpdateStatus_SurfacesDegradedMessage(t *testing.T) {
+	dao := &fakeAgentRuntimeDao{getResult: &agentRuntimes.AgentRuntime{Status: strPtr("Running")}}
+	svc := agentRuntimes.NewAgentRuntimeService(dao, &fakeEventService{})
+
+	msg := `SecretSource "amber-key" failed to sync`
+	got, err := svc.UpdateStatus(context.Background(), "ar-1", "Degraded", &msg)
+	if err != nil {
+		t.Fatalf("UpdateStatus returned error: %v", err)
+	}
+	if got.StatusMessage == nil || *got.StatusMessage != msg {
+		t.Fatalf("status message = %v, want %q", got.StatusMessage, msg)
+	}
+}
+
+// A reconcile that re-confirms the current status must not re-write the row (which
+// would fire a self-event and risk a status write-back loop).
+func TestUpdateStatus_ShortCircuitsWhenUnchanged(t *testing.T) {
+	dao := &fakeAgentRuntimeDao{getResult: &agentRuntimes.AgentRuntime{Status: strPtr("Running")}}
+	svc := agentRuntimes.NewAgentRuntimeService(dao, &fakeEventService{})
+
+	if _, err := svc.UpdateStatus(context.Background(), "ar-1", "Running", nil); err != nil {
+		t.Fatalf("UpdateStatus returned error: %v", err)
+	}
+	if dao.updateStatusCalls != 0 {
+		t.Fatalf("updateStatusCalls = %d, want 0 (no write when unchanged)", dao.updateStatusCalls)
 	}
 }
