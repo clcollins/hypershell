@@ -13,6 +13,8 @@ import type {
   TopologyData,
 } from "../../../application/ports";
 import { FleetApiProvider } from "../../query/api-context";
+import { createMemoryHistory } from "../../routing/history-port";
+import { RouterProvider } from "../../routing/router";
 import { App } from "../app";
 
 function plane<T>(data: T): Plane<T> {
@@ -122,7 +124,9 @@ function renderApp(): void {
     <IntlProvider locale="en" defaultLocale="en">
       <QueryClientProvider client={queryClient}>
         <FleetApiProvider value={api}>
-          <App />
+          <RouterProvider history={createMemoryHistory()}>
+            <App />
+          </RouterProvider>
         </FleetApiProvider>
       </QueryClientProvider>
     </IntlProvider>,
@@ -153,5 +157,34 @@ describe("TopologyMap details drawer", () => {
     // With the drawer already closed, Escape is a no-op (no throw, still closed).
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("button", { name: "Close details" })).toBeNull();
+  });
+
+  it("leaves the drawer open when Escape targets a nested dialog (GLASS-NAV-15)", async () => {
+    renderApp();
+
+    const [node] = await screen.findAllByRole("button", { name: "staging" });
+    if (!node) {
+      throw new Error("expected a selectable 'staging' map node");
+    }
+    fireEvent.click(node);
+    expect(
+      await screen.findByRole("button", { name: "Close details" }),
+    ).toBeDefined();
+
+    // Escape raised from inside a nested dialog (the expanded log modal) must be
+    // handled by that dialog, not collapse the whole gate drawer underneath it.
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    const inside = document.createElement("button");
+    dialog.appendChild(inside);
+    document.body.appendChild(dialog);
+    try {
+      fireEvent.keyDown(inside, { key: "Escape" });
+      expect(
+        screen.queryByRole("button", { name: "Close details" }),
+      ).not.toBeNull();
+    } finally {
+      document.body.removeChild(dialog);
+    }
   });
 });
