@@ -520,36 +520,80 @@ SHALL reference an existing `SecretSource`.
 
 ### Requirement: Declarative `.hypershell` Import
 
-The declarative import process SHALL enumerate all registered `Repository`
-records, read each at its `import_path` (default `.hypershell`), and render the
-declarative HyperShell resources it finds into the API. The `.hypershell`
-directory SHALL be a Kustomize root: the import process SHALL build the
-kustomization and reconcile the rendered resources - the same kinds `hsctl apply`
-supports (`AgentRuntime`, `SandboxTemplate`, `ProviderSpec`, `ProviderBinding`,
-`InferenceRoute`, `SecretSource`) - into the API.
+The declarative import SHALL be performed by a single component, the
+`RepositoryReconciler`, which reconciles the `Repository` Kind. It SHALL enumerate
+all registered `Repository` records, read each at its `import_path` (default
+`.hypershell`), and render the declarative HyperShell resources it finds into the
+API. This is the system's one git-to-API sync component - the same component named
+the declarative `.hypershell` import reconciler in
+[`control-plane.spec.md`](./control-plane.spec.md) and the `RepositoryReconciler`
+in [`openshell-gateway.spec.md`](./openshell-gateway.spec.md); there is no separate
+"PlatformReconciler" or second GitOps sync engine. It does not exist in the code
+yet; it is desired state to be built. The `.hypershell` directory SHALL be a
+Kustomize root: the `RepositoryReconciler` SHALL build the kustomization and
+reconcile the rendered resources into the API.
 
-The import process SHALL be hosted by the **control plane**, the reconciler of the
-system, NOT by the API server. For each `Repository` the control plane SHALL:
+The Kinds the `RepositoryReconciler` imports are defined here canonically as the
+**importable Kinds**, exactly seven: `AgentRuntime`, `SandboxTemplate`, `ProviderSpec`,
+`ProviderBinding`, `InferenceRoute`, `SecretSource`, and `Gateway`.
+These are the declarable HyperShell Kinds a `.hypershell` root MAY contain. They are
+a SUBSET of the Kinds `hsctl apply` accepts: `hsctl apply` also accepts
+platform-admin Kinds (for example `ManagedCluster`, `Role`, and `RoleBinding`) that
+are NOT importable through a `Repository`. `Repository` itself is also explicitly
+EXCLUDED from the importable set: the `RepositoryReconciler` reconciles the
+`Repository` Kind but SHALL NEVER upsert `Repository` resources discovered in an
+import, so that importing one repository cannot register further repositories and
+trigger recursive or transitive imports (infinite recursion). This canonical list is
+referenced - not re-enumerated - by [`control-plane.spec.md`](./control-plane.spec.md)
+("Declarative `.hypershell` Import Reconciliation") and
+[`openshell-gateway.spec.md`](./openshell-gateway.spec.md) ("Relationship to the
+RepositoryReconciler") so the importable set never drifts across specs.
 
-1. Read the `Repository`'s `secret_source_id` value from the configured secret
-   store through its read-only secret-store client (`pkg/secretstore`), when a
-   credential is needed for git access. This is the same read-only store access the
-   control plane uses to place `AgentRuntime` secrets; it does NOT create an
-   `ExternalSecret` and does NOT depend on External Secrets Operator.
-2. Git-clone the `Repository` at its `default_branch` (or the branch otherwise
-   specified) using that read credential.
-3. Render the Kustomize root at `import_path` by invoking `hsctl` (the CLI's
-   Kustomize render/apply path), NOT an embedded Kustomize library.
+The `RepositoryReconciler` upserts these resources into the API only; it does NOT
+provision them cluster-side. Each imported Kind is subsequently reconciled into the
+cluster by ITS OWN per-Kind reconciler (for example, the `AgentRuntimeReconciler`
+reconciles an imported `AgentRuntime` into cluster scheduling and gateway-side
+objects, and the `GatewayReconciler` reconciles an imported `Gateway` into
+Kubernetes). This division of labor is the established control-plane pattern.
+
+The `RepositoryReconciler` SHALL be hosted by the **control plane**, the reconciler
+of the system, NOT by the API server. It SHALL run as a reconcile LOOP and SHALL perform
+the read and render entirely in-process and in-memory: no git clone, no working
+directory, no persistent disk or PVC, no external `git` / `kustomize` / `hsctl`
+binary, and no Kubernetes `Job`. For each `Repository` the control plane SHALL:
+
+1. Resolve the credential used to read the `Repository` subtree. The platform
+   GitHub App credential is the DEFAULT transport and reads any GitHub-hosted
+   repository subtree. When the `Repository` declares a `secret_source_id`, that
+   per-`Repository` credential takes precedence and supplies a repository-specific
+   git credential - for example a private or non-GitHub-App-covered source; the
+   control plane reads its value from the configured secret store through its
+   read-only secret-store client (`pkg/secretstore`). This is the same read-only
+   store access the control plane uses to place `AgentRuntime` secrets; it does NOT
+   create an `ExternalSecret` and does NOT depend on External Secrets Operator.
+2. Read ONLY the `import_path` subtree through the GitHub API at the `Repository`'s
+   `default_branch` (or the branch otherwise specified), authenticating with the
+   credential resolved in step 1 - the per-`Repository` `secret_source_id` credential
+   when one is configured, otherwise the default platform GitHub App credential. The
+   import SHALL fetch only that subtree, NOT the whole repository, and SHALL NOT
+   perform a git clone or checkout and SHALL NOT create any on-disk working copy.
+3. Render the Kustomize root at `import_path` IN MEMORY through the shared kustomize
+   library: the exported `Build` of the `pkg/kustomize` package that lives in
+   `components/cli` and is consumed by exactly two callers, `hsctl` and the control
+   plane's `RepositoryReconciler`. The render
+   SHALL use an in-memory filesystem built from the fetched subtree. The import SHALL
+   NOT invoke an external `kustomize` or `hsctl` binary and SHALL NOT embed a second,
+   divergent Kustomize implementation.
 4. Reconcile (create / update / prune) the rendered ext resources into the API
    over the generated gRPC write path, marking each written resource with its
    owning `Repository` (`repository_id`).
 
 The control plane holds per-cluster in-cluster credentials, read-only secret-store
-access, and the git access the import requires; the API server holds no read access
-to the secret store and no git access. Hosting the import in the control plane
-therefore places it where the credential read and repository access already exist,
-and removes the in-process-secret-resolution blocker that would otherwise fall on
-the API server.
+access, and the platform GitHub App credential the import requires; the API server
+holds no read access to the secret store and no repository read access. Hosting the
+import in the control plane therefore places it where the credential read and
+repository access already exist, and removes the in-process-secret-resolution
+blocker that would otherwise fall on the API server.
 
 The API server's only secret role in this flow is the secret-submission endpoint
 defined in "Requirement: Secret Submission and Storage" below: it stores a
@@ -560,9 +604,9 @@ secret value in-process and SHALL NOT clone a git repository.
 **Control-plane write exception (bounded).** The control plane is otherwise the
 reader of desired state and never authors API desired state: it writes back only
 derived resource `status` and provisions gateway-side objects through the gateway
-gRPC API. The declarative-import reconciler is the SINGLE, clearly-bounded
+gRPC API. The `RepositoryReconciler` is the SINGLE, clearly-bounded
 control-plane path that writes HyperShell API desired-state resources. That
-exception is scoped precisely: the import reconciler SHALL write ONLY ext
+exception is scoped precisely: the `RepositoryReconciler` SHALL write ONLY ext
 resources that are owned by the originating `Repository`, SHALL perform only
 create / update / prune on those Repository-owned resources over the generated gRPC
 write path, SHALL mark each written resource with its owning `Repository` so
@@ -578,7 +622,13 @@ desired-state resources. This resolves what would otherwise contradict the "cont
 plane is a reader of desired state" principle: the principle holds everywhere except
 this one named, ownership-scoped reconciler.
 
-Imported resources SHALL be owned by the originating `Repository`. The import
+Imported resources SHALL be owned by the originating `Repository`. Every one of the
+seven importable Kinds - `AgentRuntime`, `SandboxTemplate`, `ProviderSpec`,
+`ProviderBinding`, `InferenceRoute`, `SecretSource`, and `Gateway` - SHALL carry a
+nullable, read-only `repository_id` ownership mark for this purpose: it is NULL for a
+resource created directly through the REST API or `hsctl apply`, and set server-side to
+the originating `Repository` for an imported resource, so prune can be scoped to the
+owning `Repository`. The import
 process SHALL reconcile, not create-and-skip: a resource added to `.hypershell`
 is created, a changed resource is updated, and a resource removed from
 `.hypershell` is pruned. Re-running the import against unchanged repository state
@@ -598,8 +648,8 @@ by another Repository or created directly through the REST API or `hsctl apply`.
 
 - GIVEN a registered `Repository` whose `.hypershell` directory declares a `SandboxTemplate` and an `AgentRuntime`
 - WHEN the control-plane import reconciler runs
-- THEN it SHALL read the `Repository`'s credential from the store, git-clone the repository, and render the kustomization via `hsctl`
-- AND it SHALL upsert both resources into the API over the gRPC write path
+- THEN it SHALL read only the `import_path` subtree through the GitHub API at the `default_branch` (reading the credential from the store for a private repository) without cloning the repository
+- AND it SHALL render the kustomization in memory through the shared `pkg/kustomize` `Build` and upsert both resources into the API over the gRPC write path
 - AND the resources SHALL be owned by the `Repository` (`repository_id` set server-side)
 
 #### Scenario: Removed Declaration Is Pruned
@@ -1083,15 +1133,15 @@ With `-o json`: JSON array of all applied resources.
 hsctl apply -k <dir>                # build kustomization in <dir> and apply the result
 ```
 
-Builds and applies HyperShell resources from a Kustomize directory. The `-k` flag shells out to the `kustomize` binary (which must be installed and available in PATH), builds the manifests, and applies each resource using the same reconciliation logic as `-f`.
+Builds and applies HyperShell resources from a Kustomize directory. The `-k` flag renders the kustomization IN-PROCESS through the shared `pkg/kustomize` library (the exported `Build` in `components/cli`, the same implementation the control plane's `RepositoryReconciler` uses), then applies each resource using the same reconciliation logic as `-f`. It does NOT shell out to an external `kustomize` binary; no `kustomize` binary needs to be installed or on PATH.
 
 ##### Security Features
 
 The implementation includes the following security constraints:
 
-1. **No Arbitrary Plugin Execution**: The command runs kustomize with `--enable-alpha-plugins=false` to prevent execution of arbitrary plugins.
+1. **No Arbitrary Plugin Execution**: The shared library builds with alpha plugins disabled to prevent execution of arbitrary plugins.
 
-2. **Load Restrictions**: Uses `--load-restrictor=LoadRestrictionsRootOnly` to restrict local file loading to the kustomize root directory. Note that remote bases referenced via git or http URLs in `kustomization.yaml` are not blocked by this restriction.
+2. **Load Restrictions**: The library restricts local file loading to the kustomize root (root-only load restriction). Note that remote bases referenced via git or http URLs in `kustomization.yaml` are not blocked by this restriction.
 
 3. **No Secret Leakage**: The command does not print secret values. Only resource status (created/configured/unchanged) is displayed.
 
@@ -1147,8 +1197,7 @@ The command provides clear error messages for common issues:
 
 - **Missing Directory**: `Error: kustomize directory not found: /nonexistent`
 - **Missing kustomization.yaml**: `Error: no kustomization.yaml or kustomization.yml found in ./empty-dir/`
-- **Invalid Kustomize Content**: `Error: kustomize build failed: <detailed error from kustomize>`
-- **Kustomize Binary Missing**: `Error: kustomize binary not found in PATH - install from https://kustomize.io/`
+- **Invalid Kustomize Content**: `Error: kustomize build failed: <detailed error from the shared kustomize library>`
 
 Build and validation errors identify source files and return non-zero exit codes.
 
@@ -1163,8 +1212,7 @@ The `-k` flag uses the same reconciliation semantics as `-f`:
 
 ##### Requirements
 
-- `kustomize` binary must be installed and available in PATH
-- Install from: https://kustomize.io/
+- No external `kustomize` binary is required; rendering is in-process through the shared `pkg/kustomize` library (`components/cli`), which is also consumed by the control plane's `RepositoryReconciler` so CLI and server render identically.
 
 #### Examples
 
@@ -1248,6 +1296,7 @@ hsctl create gateway --name api-gateway --cluster-id eks-1 --image quay.io/opend
 | Repository credential via SecretSource FK | Reuses the existing abstract secret store model (Vault/AWS/Kubernetes) and the control plane's read-only store placement, keeping provider secrets out of the database and consistent with every other credential in the platform. |
 | AgentRuntime.selector as a label list (match-any) | Declarative repository scanning replaces the imperative `discover.sh` script. A simple label list is enough to express "scan these items" (e.g. `agent/reviewable`); an item matching any label yields one sandbox from the runtime's SandboxTemplate. Requires `repository_id`. |
 | Declarative `.hypershell` import over script invocation | Rendering declared Kustomize YAML into the API is safer and more predictable than executing `discover.sh`/`run.sh` found in an arbitrary repo. Imported resources are owned and pruned by the Repository (reconcile, don't create-or-skip). Deprecates the script-at-endpoint coordinator contract. |
-| `.hypershell` import hosted by the control plane, not the api-server | The import must read each `Repository`'s `secret_source_id` credential and git-clone the repository. The control plane has read-only secret-store access (`pkg/secretstore`) and git/cluster access; the api-server has no store read access and no git access. Hosting the import in the control plane places it where the credential read and repository access already live and removes the in-process-secret-resolution blocker. The import is the single bounded control-plane path that writes API desired state (over the gRPC write path, `Repository`-scoped), scoped to create/update/prune of `Repository`-owned ext resources. The api-server's only secret role is a write-only POST endpoint that stores the submitted value in the secret store and its reference (a `SecretSource`) in the database. |
+| `.hypershell` import hosted by the control plane, not the api-server | The import must read each `Repository`'s `secret_source_id` credential and read the `import_path` subtree over the GitHub API. The control plane has read-only secret-store access (`pkg/secretstore`) and the platform GitHub App credential; the api-server has no store read access and no repository read access. Hosting the import in the control plane places it where the credential read and repository access already live and removes the in-process-secret-resolution blocker. The import is the single bounded control-plane path that writes API desired state (over the gRPC write path, `Repository`-scoped), scoped to create/update/prune of `Repository`-owned ext resources. The api-server's only secret role is a write-only POST endpoint that stores the submitted value in the secret store and its reference (a `SecretSource`) in the database. |
+| Import reads the subtree over the GitHub API and renders in-memory; one shared kustomize library | The control-plane runtime image ships no `git` / `kustomize` / `hsctl` binary and no writable disk, so the `RepositoryReconciler` reads only the `import_path` subtree over the GitHub API (no clone, no checkout, no PVC) and renders it in memory. Rendering SHALL use the shared `pkg/kustomize` `Build` in `components/cli` (desired state, to be built), consumed by exactly two callers, `hsctl` and the `RepositoryReconciler`, so there is exactly one kustomize implementation and CLI and server render identically. The `GatewayReconciler` is not a consumer: it renders the gateway workload through Helm. `hsctl apply -k` is refactored off its external-`kustomize`-binary shell-out onto this same package. The accepted trade-off is admitting the kustomize Go library (a library, not a binary or `Job`) into the control-plane module - a deliberate reversal of the earlier "no kustomize in control plane" decision. |
 | Remove GatewayRelease | Gateway `image`/`supervisor_image` fields make the release indirection layer unnecessary; canary rollout was never adopted in practice. Direct image references cover all current use cases. |
 | Remove GatewayNetwork | The reconciler only validates topology vocabulary and writes status - it owns no Kubernetes resources and applies no actual connectivity. Real mesh/tunnel provisioning was never defined by the product. Removing until concrete connectivity semantics are specified. |

@@ -461,11 +461,13 @@ For a caller that is not a control-plane identity, the rules mirror HTTP:
   Deregistration").
 - `RoleBindingService`: denied. Its list and watch are not filtered by user or gateway;
   users manage bindings over HTTP.
-- Import ext kinds (`RepositoryService`, `SandboxTemplateService`, `ProviderSpecService`,
+- Fleet-wide ext kinds (`RepositoryService`, `SandboxTemplateService`, `ProviderSpecService`,
   `ProviderBindingService`, `InferenceRouteService`, `SecretSourceService`): list, watch,
-  and get for `platform:admin`; all writes (create/update/delete) denied. These kinds are
-  fleet-wide, so a user caller never writes them over gRPC; declarative-import writes are
-  authorized only for the control-plane identity (see below).
+  and get for `platform:admin`; all writes (create/update/delete) denied for user callers.
+  These kinds are fleet-wide, so a user caller never writes them over gRPC. For the
+  import-write kinds among them (all except `RepositoryService`), declarative-import writes
+  are authorized only for the control-plane identity (see below); `RepositoryService` is NOT
+  on the import-write path because the import never upserts `Repository` resources.
 - Under `RBAC_ENFORCE=true` an unauthenticated call reaches no `hypershell.v1` method.
 
 Control-plane identities are exempt from role bindings but not from scoping. A caller
@@ -480,9 +482,15 @@ declarative `.hypershell` import reconciler (see
 [`platform/control-plane.spec.md`](../platform/control-plane.spec.md), "Declarative
 `.hypershell` Import Reconciliation") is the single bounded path by which the control
 plane writes HyperShell API desired state. The gRPC `Create`, `Update`, and `Delete`
-methods for the import ext kinds (`Repository`, `SandboxTemplate`, `ProviderSpec`,
+methods for the import-write kinds (`SandboxTemplate`, `ProviderSpec`,
 `ProviderBinding`, `InferenceRoute`, `SecretSource`) SHALL be authorized for the
-control-plane identity and SHALL remain denied for every other caller. These writes
+control-plane identity and SHALL remain denied for every other caller. `Repository`
+is NOT an import-write kind: the import reconciler reconciles the `Repository` Kind but
+SHALL NEVER upsert `Repository` resources discovered in an import (it is excluded from
+the canonical importable set in
+[`platform/data-model.spec.md`](../platform/data-model.spec.md) to prevent recursive
+import), so the import write path SHALL NOT create, update, or delete `Repository`
+resources. These writes
 are `Repository`-scoped through the `repository_id` ownership mark, not an open
 bootstrap bypass:
 
@@ -498,6 +506,28 @@ bootstrap bypass:
   from the control-plane identity and `Repository` ownership, not from that allowlist.
   A bootstrap service account that is not a registered control plane SHALL NOT be
   treated as an import reconciler.
+
+The remaining importable Kinds, `Gateway` and `AgentRuntime`, are cluster-assigned and
+their gRPC `Create`, `Update`, and `Delete` are also authorized for the control-plane
+identity on the same `Repository`-scoped import terms: a write marked with the
+reconciled `Repository` id in trusted metadata is authorized as an import write, the
+server SHALL set `repository_id` from that metadata (ignoring any client value), and a
+write to a `Gateway` or `AgentRuntime` owned by a different `Repository`, or unowned,
+SHALL be refused. A `Gateway` or `AgentRuntime` write that carries NO import metadata
+stays on its existing non-import path (the control plane's cluster-scoped health and
+status write-backs), unchanged.
+
+**Declarative-import reads (control-plane identity only).** `Gateway` and
+`AgentRuntime` list reads are normally held to the caller's own `cluster_id` by the
+watch-stream caller binding. Because the single import reconciler must enumerate and
+prune a `Repository`'s gateways and agent runtimes across clusters, a `ListGateways`
+or `ListAgentRuntimes` read SHALL be exempted from the own-cluster requirement, and
+served across clusters, ONLY when ALL hold: the caller is the registered
+control-plane identity; the call carries the reconciled-`Repository` id in trusted
+metadata; the request sets the `repository_id` read filter equal to that id; and the
+named `Repository` exists. The server then filters the result to that `Repository`
+server-side. Any other read keeps the own-cluster binding, so this exemption does not
+widen a tenant's or a spoke's view beyond one named `Repository` it is reconciling.
 
 The hub's gRPC API is reachable from outside the cluster (`platform/hub-grpc-tls.spec.md`),
 so these rules are the only boundary between tenants, and between clusters, on that API.
