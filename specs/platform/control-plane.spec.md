@@ -283,6 +283,83 @@ created (`Namespace`, `ServiceAccount`, `NetworkPolicy`, the coordinator
 `AgentWorkspace`, its OpenShell providers, and its sub-resources through the gateway
 gRPC API.
 
+The gateway-side provisioning seam SHALL be **live**: the `ProviderRealizer` is
+constructed against the gateway `WorkspaceProvisioningPort`
+([`agent-workspace-gateway-api.spec.md`](./agent-workspace-gateway-api.spec.md)) and
+the reconciler SHALL drive it on every reconcile rather than hold a transitional
+behavior. The reconcile SHALL run the gateway sequence in this order, reading its
+inputs from the embedded reconcile payload
+([`data-model.spec.md`](./data-model.spec.md), "AgentRuntime Reconcile Payload
+Completeness"):
+
+1. `EnsureWorkspace` for the owning `agent_runtime_id` and resolved workspace name.
+2. `ReconcileMemberships` declaratively over the full membership set, so an admin
+   membership exists before any refresh-bearing provider is ensured.
+3. `EnsureProvider` for each provider the runtime realizes, from its `refresh_strategy`
+   and the durable material read cluster-local, honoring the `SecretPending` gate when
+   material is absent. The target end state is one `EnsureProvider` per `ProviderBinding`
+   keyed by the binding's `secret_source_id`; the current activation step realizes one
+   provider per resolved provider `SecretSource` keyed by its `purpose`, because the
+   embedded payload does not yet carry the `SecretSource` id needed to join material to
+   its binding. Carrying that id and realizing strictly per `ProviderBinding` (with its
+   `provider_spec_id`) is a tracked follow-up.
+4. `EnsureInferenceRoute` for the single declared route.
+
+On `AgentRuntime` deletion the reconcile SHALL call `DeleteWorkspace`, cascading the
+workspace, its memberships, its realized providers, and its inference route; shared
+`ProviderSpec`s SHALL be preserved. The ordering, idempotency, enforcement, retry, and
+cascade semantics of these RPCs are owned by
+[`agent-workspace-gateway-api.spec.md`](./agent-workspace-gateway-api.spec.md).
+
+At this activation the transitional raw-`Secret` placement of **provider material**
+SHALL be retired: the control plane SHALL NOT place a raw credential `Secret` for any
+provider-material `SecretSource`, and the reconcile prune path SHALL REMOVE any
+previously-placed raw provider-material `Secret` left by the transitional behavior, so
+no straggler credential `Secret` remains on the cluster after cutover. The retirement
+SHALL be **realize-before-prune**: the reconcile SHALL realize the provider through the
+gateway contract FIRST and prune the previously-placed raw provider-material `Secret`
+only AFTER realization succeeds, so the cutover never leaves a window in which neither a
+realized provider nor its raw `Secret` is present. When provider material is not yet
+present and the runtime holds under `SecretPending` (see below and
+[`agent-secret-late-binding.spec.md`](./agent-secret-late-binding.spec.md), "SecretPending
+Condition Gates Provider Creation"), the reconcile SHALL NOT prune the previously-placed
+raw `Secret` for that provider, so a partially-uploaded fleet keeps its working credential
+until its replacement provider is realized. The coordinator `gateway-identity` carve-out
+SHALL remain unchanged: the `gateway-identity` material is still read cluster-local and
+wired as coordinator environment (it is NOT a provider and is NOT a rendered provider
+credential), and the prune SHALL NOT remove it
+([`agent-secret-late-binding.spec.md`](./agent-secret-late-binding.spec.md),
+"Credentials Realized as OpenShell Providers, Not Rendered Secrets").
+
+#### Scenario: Realizer drives the gateway sequence in order
+
+- GIVEN an `AgentRuntime` whose embedded payload carries a workspace name, memberships, one `ProviderBinding` with a non-empty `refresh_strategy`, and an `InferenceRoute`, with the referenced material present cluster-local
+- WHEN the control plane reconciles it
+- THEN it SHALL call `EnsureWorkspace`, then `ReconcileMemberships`, then `EnsureProvider` for each realized provider, then `EnsureInferenceRoute`, through the live `ProviderRealizer`
+- AND it SHALL render no raw credential `Secret` for the provider material
+- AND re-running the reconcile against unchanged state SHALL make no change
+
+#### Scenario: Cutover prunes previously-placed provider-material Secrets, keeps gateway-identity
+
+- GIVEN an `AgentRuntime` previously reconciled by the transitional behavior that left a raw provider-material `Secret` on the cluster
+- WHEN the control plane reconciles it with the realizer live
+- THEN it SHALL realize the provider through the gateway contract and SHALL remove the straggler raw provider-material `Secret`
+- AND it SHALL leave the coordinator `gateway-identity` wiring in place
+
+#### Scenario: SecretPending holds the prune so the working credential is kept
+
+- GIVEN an `AgentRuntime` previously reconciled by the transitional behavior whose raw provider-material `Secret` is still in place, and whose provider material is not yet present in the assigned cluster's reachable store
+- WHEN the control plane reconciles it with the realizer live
+- THEN it SHALL hold under `SecretPending` without realizing the provider
+- AND it SHALL NOT prune the previously-placed raw provider-material `Secret`, so the agent keeps a working credential until the provider is realized
+
+#### Scenario: AgentRuntime deletion cascades the gateway workspace
+
+- GIVEN an `AgentRuntime` with a provisioned workspace, memberships, a realized provider, and an inference route
+- WHEN a delete event arrives on the watch stream
+- THEN the control plane SHALL call `DeleteWorkspace`, cascading the workspace, memberships, provider, and inference route on the gateway
+- AND it SHALL NOT delete any shared `ProviderSpec`
+
 #### Scenario: New AgentRuntime is provisioned end to end
 
 - GIVEN a new `AgentRuntime` with status `Pending` whose effective cluster is this control plane's `cluster_id`
