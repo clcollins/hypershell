@@ -50,15 +50,18 @@ carried on any gRPC message (the `SecretSource` gRPC message has no value field)
 NOT be persisted in the database, and SHALL NOT appear in logs, events, or the query
 cache.
 
-The control plane SHALL NOT mint, refresh, or rotate the usable credential and SHALL
-NOT place or rotate a raw credential `Secret`. Keeping the usable credential current is
-OWNED BY OpenShell, through the provider `refresh_strategy`
-(`app-installation-token`, `google-service-account-jwt`, `static-token`): given the
-durable material, OpenShell mints and rotates the short-lived credential itself. A
-reference whose material has not yet been supplied is a benign waiting state, not a
-failure: the control plane SHALL hold with a `SecretPending` condition that gates
-PROVIDER CREATION, SHALL NOT configure a provider with empty material, and SHALL
-converge when the material first appears (see
+The control plane SHALL NOT place or rotate a raw credential `Secret`. Keeping the usable
+credential current is owned by the refresh strategy's rotation owner: for the strategies
+OpenShell supports natively (`google-service-account-jwt`, `oauth2-refresh-token`,
+`oauth2-client-credentials`, `aws-sts-assume-role`, `static-token`) OpenShell mints and
+rotates the short-lived credential itself, and the control plane SHALL NOT mint, refresh,
+or rotate it; for GitHub App credentials (the `app-installation-token` intent, which the
+installed OpenShell CLI does not refresh) a bounded control-plane GitHub rotator mints the
+installation token from the stored PEM and sets it on the OpenShell provider through
+`provider update --credential`, re-minting before expiry. A reference whose material has
+not yet been supplied is a benign waiting state, not a failure: the control plane SHALL
+hold with a `SecretPending` condition that gates PROVIDER CREATION, SHALL NOT configure a
+provider with empty material, and SHALL converge when the material first appears (see
 [`platform/agent-secret-late-binding.spec.md`](../../platform/agent-secret-late-binding.spec.md)).
 
 **Three separate secret planes, never conflated.** The agent-secret plane (the
@@ -96,12 +99,19 @@ gateway-provider Vault plane.
 - THEN the material SHALL be written and read only within cluster `Y`'s local agent-secret store, never a hub or global store
 - AND the writer identity SHALL be permitted to write only under `secret/data/hypershell/secret-sources/*` and SHALL NOT read provider material or write the gateway-provider Vault plane
 
-#### Scenario: Rotation is owned by OpenShell, not the control plane
+#### Scenario: OpenShell-native strategy rotation is owned by OpenShell
 
-- GIVEN an agent credential realized as an OpenShell provider from stored durable material
+- GIVEN an agent credential realized as an OpenShell provider from stored durable material with an OpenShell-native refresh strategy (`google-service-account-jwt`, `oauth2-refresh-token`, `oauth2-client-credentials`, `aws-sts-assume-role`, or `static-token`)
 - WHEN the short-lived usable credential expires
 - THEN OpenShell SHALL mint and rotate it under the provider `refresh_strategy`
 - AND the control plane SHALL NOT mint, refresh, or rotate the credential and SHALL NOT render or re-place a raw credential `Secret`
+
+#### Scenario: GitHub App credential rotation is owned by the control-plane rotator
+
+- GIVEN an agent GitHub provider realized from a stored GitHub App PEM (the `app-installation-token` / `app-private-key` intent), which the installed OpenShell CLI does not refresh
+- WHEN the short-lived installation token approaches expiry
+- THEN the bounded control-plane GitHub rotator SHALL mint a fresh installation token from the PEM and set it on the OpenShell provider through `provider update --credential`
+- AND OpenShell SHALL NOT rotate it and the control plane SHALL NOT render or re-place a raw credential `Secret`
 
 ### Input Validation
 
@@ -157,7 +167,7 @@ Gateways are scoped by per-gateway RBAC RoleBindings (`gateway:owner`, `gateway:
 - [ ] Secret values absent from routine API responses
 - [ ] One-time credential responses use `no-store`, redact telemetry, and never persist plaintext
 - [ ] Secret store access is single-directional: API server write-only, control plane read-only; no `ExternalSecret`/ESO resolution; no raw credential `Secret` rendered for provider material
-- [ ] Agent credentials realized as OpenShell providers; OpenShell owns rotation; control plane never mints/refreshes/rotates the usable credential; `SecretPending` gates provider creation
+- [ ] Agent credentials realized as OpenShell providers; rotation ownership split by strategy (OpenShell owns its native strategies and the control plane never mints/refreshes/rotates those; a bounded control-plane GitHub rotator owns the `app-installation-token` GitHub App credential); `SecretPending` gates provider creation
 - [ ] Agent-secret, gateway-provider, and application-secret planes kept separate; agent-secret reads are cluster-local (no hub/global store); writer scoped to `secret/data/hypershell/secret-sources/*`
 
 **Input:**
